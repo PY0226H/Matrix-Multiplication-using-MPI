@@ -9,6 +9,7 @@
 module purge
 module use /projects/comp422/modulefiles
 module load assignment3
+module load gompi/2023b
 
 # Map P → c so that P/c is a perfect square
 declare -A CVALS=( [4]=1 [9]=1 [16]=4 [25]=5 [36]=9 [49]=7 [64]=16 )
