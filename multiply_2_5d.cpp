@@ -1,141 +1,225 @@
+// multiply_2_5d.cpp – Communication‑optimal 2.5D matrix multiplication (MPI + C++17)
+// -----------------------------------------------------------------------------
+// Implements Solomonik et al. 2.5‑D algorithm on a √(P/c) × √(P/c) × c processor
+// grid.  Each rank owns three b×b tiles (A,B,C).
+//
+// Compile examples
+//   # baseline   (naïve local GEMM)
+//   mpicxx -O3 -std=c++17 -march=native -o multiply_2_5d multiply_2_5d.cpp
+//
+//   # peak flops (OpenBLAS + verification)
+//   mpicxx -O3 -std=c++17 -DUSE_BLAS -lopenblas -DVERIFY -o multiply_2_5d multiply_2_5d.cpp
+//
+// Usage
+//   mpirun -np <P> ./multiply_2_5d N [c]
+//     N – global matrix dimension (square)    (required)
+//     c – replication factor (optional). If omitted, code picks the
+//         largest c ≤ P such that P/c is a perfect square.
+//
+// Flags
+//   -DUSE_BLAS  : use dgemm for local multiplication (requires BLAS)
+//   -DVERIFY    : for N ≤ 1024 compute serial reference and print error
+//
+// =============================================================================
 #include <mpi.h>
-#include <cstdlib>
-#include <cstdio>
 #include <cmath>
-#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
-// 2.5D Parallel Matrix Multiplication in C++ with MPI
-// ---------------------------------------------------
-// A: NxN, B: NxN, C: NxN (square matrices for simplicity)
-// 3D grid of processors: dims = [p_side, p_side, c]
+#ifdef USE_BLAS
+extern "C" void dgemm_(const char*, const char*, const int*, const int*, const int*,
+                        const double*, const double*, const int*, const double*, const int*,
+                        const double*, double*, const int*);
+#endif
 
+// ----------------------------------------------------------------------------
+static inline double* alloc_mat(int m, int n) {
+    return static_cast<double*>(std::malloc(sizeof(double) * m * n));
+}
+
+static inline void fill_rand(double* A, int m, int n, unsigned long seed) {
+    srand48(seed);
+    for (long i = 0; i < (long)m * n; ++i) A[i] = drand48() - 0.5;
+}
+
+static inline void zero_mat(double* A, int m, int n) {
+    std::memset(A, 0, sizeof(double) * m * n);
+}
+
+static inline void local_gemm(const double* A, const double* B, double* C, int b) {
+#ifdef USE_BLAS
+    const double one = 1.0, zero = 1.0;   // C ← C + A·B
+    dgemm_("N", "N", &b, &b, &b, &one, A, &b, B, &b, &one, C, &b);
+#else
+    for (int i = 0; i < b; ++i)
+        for (int k = 0; k < b; ++k) {
+            double aik = A[i * b + k];
+            for (int j = 0; j < b; ++j)
+                C[i * b + j] += aik * B[k * b + j];
+        }
+#endif
+}
+
+// Choose the largest replication factor c such that P/c is a perfect square
+static int choose_c(int P) {
+    int best = 1;
+    for (int cand = 2; cand <= P; ++cand) {
+        if (P % cand) continue;
+        int q = P / cand;
+        int root = (int)std::round(std::sqrt(q));
+        if (root * root == q) best = cand;
+    }
+    return best;
+}
+
+// ----------------------------------------------------------------------------
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
-    // Get world rank & size
-    int world_rank, world_size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Parse command-line args: N (matrix dim), c (replication factor)
-    if (argc != 3) {
-        if (world_rank == 0)
-            fprintf(stderr, "Usage: %s <matrix_dim_N> <replication_c>\n", argv[0]);
-        MPI_Finalize();
-        return EXIT_FAILURE;
-    }
-    int N = atoi(argv[1]);
-    int c = atoi(argv[2]);
-
-    // Validate P divisible by c, and compute p_side
-    int P = world_size;
-    if (P % c != 0) {
-        if (world_rank == 0)
-            fprintf(stderr, "Error: P=%d must be divisible by c=%d\n", P, c);
-        MPI_Finalize();
-        return EXIT_FAILURE;
-    }
-    int p_side = (int)std::round(std::sqrt((double)P / c));
-    if (p_side * p_side * c != P) {
-        if (world_rank == 0)
-            fprintf(stderr, "Error: P/c=%d not a perfect square\n", P/c);
-        MPI_Finalize();
-        return EXIT_FAILURE;
+    if (argc < 2) {
+        if (rank == 0) std::fprintf(stderr, "Usage: %s N [c]\n", argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // Create 3D Cartesian communicator
-    int dims[3] = {p_side, p_side, c};
-    int periods[3] = {1, 1, 1};   // wraparound
-    MPI_Comm comm3d;
-    MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, 0, &comm3d);
+    const int N = std::atoi(argv[1]);
+    int c = (argc >= 3) ? std::atoi(argv[2]) : choose_c(size);
 
-    // Get my coords in comm3d
-    int rank3d;
-    MPI_Comm_rank(comm3d, &rank3d);
+    if (c < 1 || size % c != 0) {
+        if (rank == 0) std::fprintf(stderr, "Error: P %% c != 0 (P=%d, c=%d)\n", size, c);
+        MPI_Abort(MPI_COMM_WORLD, 2);
+    }
+
+    int p2 = size / c;
+    int p  = (int)std::round(std::sqrt(p2));
+    if (p * p != p2) {
+        if (rank == 0) std::fprintf(stderr, "Error: P/c (%d) is not a perfect square\n", p2);
+        MPI_Abort(MPI_COMM_WORLD, 3);
+    }
+
+    if (N % p != 0) {
+        if (rank == 0)
+            std::fprintf(stderr, "Error: N (%d) must be divisible by √(P/c) (%d)\n", N, p);
+        MPI_Abort(MPI_COMM_WORLD, 4);
+    }
+
+    /* ---------------- Cartesian grid ------------------------------------- */
+    int dims[3]    = {p, p, c};
+    int periods[3] = {1, 1, 0};          // wrap in x,y; fixed in z
+    MPI_Comm grid;
+    MPI_Cart_create(MPI_COMM_WORLD, 3, dims, periods, 0, &grid);
+
     int coords[3];
-    MPI_Cart_coords(comm3d, rank3d, 3, coords);
-    int i = coords[0], j = coords[1], k = coords[2];
+    MPI_Cart_coords(grid, rank, 3, coords);
+    int row = coords[0];
+    int col = coords[1];
+    int lay = coords[2];
 
-    // Allocate local tiles
-    int tile_size = N / p_side;
-    double* A_tile = new double[tile_size * tile_size];
-    double* B_tile = new double[tile_size * tile_size];
-    double* C_tile = new double[tile_size * tile_size];
-    for (int idx = 0; idx < tile_size * tile_size; idx++)
-        C_tile[idx] = 0.0;
+    /* sub‑communicator along z for broadcast & reduction */
+    int remain_z[3] = {0, 0, 1};
+    MPI_Comm z_comm;
+    MPI_Cart_sub(grid, remain_z, &z_comm);
 
-    // On front face (k==0), initialize A and B tiles
-    if (k == 0) {
-        srand48(time(NULL) * (i * p_side + j + 1));
-        for (int idx = 0; idx < tile_size * tile_size; idx++) {
-            A_tile[idx] = drand48();
-            B_tile[idx] = drand48();
-        }
+    /* ---------------- Allocate & initialize tiles ------------------------ */
+    const int b = N / p;
+    double *A = alloc_mat(b, b);
+    double *B = alloc_mat(b, b);
+    double *C = alloc_mat(b, b);
+    zero_mat(C, b, b);
+
+    if (lay == 0) {
+        fill_rand(A, b, b,  1ul * (row * p + col + 1));
+        fill_rand(B, b, b, 777ul * (row * p + col + 1));
     }
 
-    // Sub-communicator along k-dimension
-    int remain_dims[3] = {0, 0, 1};
-    MPI_Comm comm_k;
-    MPI_Cart_sub(comm3d, remain_dims, &comm_k);
+    /* replicate A, B across z‑stack */
+    MPI_Bcast(A, b * b, MPI_DOUBLE, 0, z_comm);
+    MPI_Bcast(B, b * b, MPI_DOUBLE, 0, z_comm);
 
-    // Broadcast initial tiles along k
-    int root_k = 0;
-    MPI_Bcast(A_tile, tile_size * tile_size, MPI_DOUBLE, root_k, comm_k);
-    MPI_Bcast(B_tile, tile_size * tile_size, MPI_DOUBLE, root_k, comm_k);
+    /* ---------------- Pre‑compute shift partners ------------------------- */
+    int dstA, srcA, dstB, srcB;
+    MPI_Cart_shift(grid, /*dimension=*/1, /*disp=*/-1, &srcA, &dstA); // A left
+    MPI_Cart_shift(grid, /*dimension=*/0, /*disp=*/-1, &srcB, &dstB); // B up
 
-    // Synchronize and start timing
-    MPI_Barrier(comm3d);
-    double t_start = MPI_Wtime();
+    /* ---------------- Timed multiply phase ------------------------------ */
+    MPI_Barrier(grid);
+    double t0 = MPI_Wtime();
 
-    // 2D shift-and-multiply loop
-    for (int t = 0; t < p_side; t++) {
-        int srcA, dstA;
-        MPI_Cart_shift(comm3d, 1, -1, &srcA, &dstA);
-        MPI_Sendrecv_replace(A_tile, tile_size * tile_size, MPI_DOUBLE,
-                             dstA, 0, srcA, 0, comm3d, MPI_STATUS_IGNORE);
+    for (int step = 0; step < p; ++step) {
+        local_gemm(A, B, C, b);
 
-        int srcB, dstB;
-        MPI_Cart_shift(comm3d, 0, -1, &srcB, &dstB);
-        MPI_Sendrecv_replace(B_tile, tile_size * tile_size, MPI_DOUBLE,
-                             dstB, 0, srcB, 0, comm3d, MPI_STATUS_IGNORE);
+        // Shift A left along row
+        MPI_Sendrecv_replace(A, b * b, MPI_DOUBLE, dstA, 0, srcA, 0, grid, MPI_STATUS_IGNORE);
+        // Shift B up along column (tag 1 to disambiguate)
+        MPI_Sendrecv_replace(B, b * b, MPI_DOUBLE, dstB, 1, srcB, 1, grid, MPI_STATUS_IGNORE);
+    }
 
-        // Local multiply accumulate
-        for (int ii = 0; ii < tile_size; ii++) {
-            for (int jj = 0; jj < tile_size; jj++) {
-                double sum = 0.0;
-                for (int kk2 = 0; kk2 < tile_size; kk2++) {
-                    sum += A_tile[ii * tile_size + kk2] * B_tile[kk2 * tile_size + jj];
-                }
-                C_tile[ii * tile_size + jj] += sum;
+    /* reduce partial C back to front face (lay == 0) */
+    if (lay == 0)
+        MPI_Reduce(MPI_IN_PLACE, C, b * b, MPI_DOUBLE, MPI_SUM, 0, z_comm);
+    else
+        MPI_Reduce(C, nullptr,      b * b, MPI_DOUBLE, MPI_SUM, 0, z_comm);
+
+    double t1 = MPI_Wtime();
+    double local_time = t1 - t0, max_time;
+    MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+        std::printf("2.5D MM: N=%d  P=%d  c=%d  time=%.6f s  GF/s=%.2f\n",
+                    N, size, c, max_time,
+                    (2.0 * N * N * (double)N / 1e9) / max_time);
+
+#ifdef VERIFY
+    if (N <= 1024) {
+        /* gather C tiles on root and compare to serial reference */
+        const int root_rank = 0;
+        std::vector<double> C_root, A_ref, B_ref, C_ref;
+        if (rank == root_rank) {
+            C_root.resize((size_t)N * N, 0.0);
+            A_ref.resize((size_t)N * N);
+            B_ref.resize((size_t)N * N);
+            C_ref.resize((size_t)N * N, 0.0);
+            fill_rand(A_ref.data(), N, N, 1);
+            fill_rand(B_ref.data(), N, N, 777);
+            /* serial reference */
+            for (int i = 0; i < N; ++i)
+                for (int k = 0; k < N; ++k)
+                    for (int j = 0; j < N; ++j)
+                        C_ref[i * N + j] += A_ref[i * N + k] * B_ref[k * N + j];
+        }
+
+        /* pack front‑face tiles into C_root */
+        if (lay == 0) {
+            std::vector<double> sendbuf(b * b);
+            std::memcpy(sendbuf.data(), C, b * b * sizeof(double));
+            MPI_Gather(sendbuf.data(), b * b, MPI_DOUBLE,
+                       rank == root_rank ? C_root.data() : nullptr,
+                       b * b, MPI_DOUBLE, root_rank, z_comm); // z_comm ranks correspond to same xy plane
+        }
+
+        if (rank == root_rank) {
+            double err = 0.0, ref = 0.0;
+            for (long idx = 0; idx < (long)N * N; ++idx) {
+                double diff = C_root[idx] - C_ref[idx];
+                err += diff * diff;
+                ref += C_ref[idx] * C_ref[idx];
             }
+            std::printf("Relative Frobenius error = %.2e\n", std::sqrt(err / ref));
         }
     }
+#endif
 
-    // Reduce C_tile along k-dimension using MPI_IN_PLACE at root
-    int rank_k;
-    MPI_Comm_rank(comm_k, &rank_k);
-    int count = tile_size * tile_size;
-    if (rank_k == root_k) {
-        MPI_Reduce(MPI_IN_PLACE, C_tile, count, MPI_DOUBLE, MPI_SUM, root_k, comm_k);
-    } else {
-        MPI_Reduce(C_tile, nullptr, count, MPI_DOUBLE, MPI_SUM, root_k, comm_k);
-    }
-
-    // Synchronize and stop timing
-    MPI_Barrier(comm3d);
-    double t_end = MPI_Wtime();
-
-    // Print timing on (0,0,0)
-    if (i == 0 && j == 0 && k == 0 && rank3d == 0) {
-        printf("2.5D MatMul: N=%d, P=%d, c=%d, time=%.6f sec\n", N, P, c, t_end - t_start);
-    }
-
-    // Cleanup
-    delete[] A_tile;
-    delete[] B_tile;
-    delete[] C_tile;
-    MPI_Comm_free(&comm_k);
-    MPI_Comm_free(&comm3d);
+    /* ---------------- cleanup ------------------------------------------- */
+    std::free(A);
+    std::free(B);
+    std::free(C);
+    MPI_Comm_free(&z_comm);
+    MPI_Comm_free(&grid);
     MPI_Finalize();
-    return EXIT_SUCCESS;
+    return 0;
 }
